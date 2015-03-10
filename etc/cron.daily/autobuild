@@ -1,0 +1,200 @@
+#!/bin/bash
+# autobuild script for all architectures
+# Requires:
+#   source home mounted at /export/home
+#   subversion access to svn://domain/target/trunk
+
+################
+#BEGIN defs
+DEBUG=1
+TIMESOURCE="timeserver.domain.com"
+ARCH=`uname -p`
+BUILD_DIR="/export/builds/autobuild/$ARCH"
+BUILDLIST=('0' '1' '2' '3' '4' '5' '6' '7')
+SVN_REPOSITORY="svn://domain/target/trunk"
+TARGET="nightly"
+HOME="/export/home/autobuild"
+SUBDIR="autobuild.${ARCH}"
+SUMMARY="${HOME}/${SUBDIR}/${TARGET}${BUILDLIST[0]}.txt"
+HTML_OUT="${HOME}/${SUBDIR}/${ARCH}_build.html"
+HEADER="Autobuild:"
+PATH=${PATH}:${HOME}
+TMPFILE=`mktemp`
+
+logger "${HEADER} /--- BEGIN AUTOBUILD ---\\"
+
+if [ `whoami` != "root" ]; then
+  echo "You must run this program as root."
+  exit 1
+fi
+
+################
+# BEGIN
+cd ${BUILD_DIR} &> /dev/null
+if [ $? == 1 ]; then 
+  if [ $DEBUG ]; then echo "${HEADER} ERROR: Could not cd to ${BUILD_DIR}"; fi
+  logger "${HEADER} cd ${BUILD_DIR} failed!"
+  FAILED=1
+else
+  if [ $DEBUG ]; then echo "Shuffling the ${#BUILDLIST[*]} old builds."; fi
+  logger "${HEADER} Shuffling the ${#BUILDLIST[*]} old builds."
+  for (( x=0; x<${#BUILDLIST[*]}; x++ )); do
+    if [ $DEBUG ]; then echo "chowning ${TARGET}${BUILDLIST[$x]} for sanity."; fi
+    chown user:users ${TARGET}${BUILDLIST[$x]} &> /dev/null
+  done
+
+  ################
+  # ROTATE PREVIOUS BUILDS
+  for (( x=${#BUILDLIST[*]}; x>0; x-- )); do
+    if [[ $x == ${#BUILDLIST[*]} ]]; then
+      if [ $DEBUG ]; then echo "Deleting the oldest build... ${BUILD_DIR}/${TARGET}${BUILDLIST[(${#BUILDLIST[*]}-1)]}"; fi
+      su user -c "rm -rf ${BUILD_DIR}/${TARGET}${BUILDLIST[(${#BUILDLIST[*]}-1)]}"
+    else
+      if [ $DEBUG ]; then echo "Aging ${BUILD_DIR}/${TARGET}${BUILDLIST[($x-1)]}"; fi
+      su user -c "mv ${BUILD_DIR}/${TARGET}${BUILDLIST[($x-1)]} ${BUILD_DIR}/${TARGET}$x &> /dev/null"
+    fi
+  done
+
+  ################
+  # ROTATE PREVIOUS BUILD SUMMARIES
+  if [ $DEBUG ]; then echo "Shuffling old build summaries."; fi
+  for (( x=${#BUILDLIST[*]}; x>0; x-- )); do
+    chown user:users "${HOME}/${SUBDIR}/${TARGET}${BUILDLIST[(${#BUILDLIST[*]}-1)]}.txt" &> /dev/null
+    if [[ $x == ${#BUILDLIST[*]} ]]; then
+      if [ $DEBUG ]; then echo "Deleting the oldest summary... (${HOME}/${SUBDIR}/${TARGET}${BUILDLIST[(${#BUILDLIST[*]}-1)]}.txt)"; fi
+      su user -c "rm -rf ${HOME}/${SUBDIR}/${TARGET}${BUILDLIST[(${#BUILDLIST[*]}-1)]}.txt"
+    else
+      if [ $DEBUG ]; then echo "Aging ${HOME}/${SUBDIR}/${TARGET}${BUILDLIST[($x-1)]}.txt"; fi
+      su user -c "mv ${HOME}/${SUBDIR}/${TARGET}${BUILDLIST[($x-1)]}.txt ${HOME}/${SUBDIR}/${TARGET}$x.txt &> /dev/null"
+    fi
+  done
+
+  ################
+  # FORCE A TIME SYNC
+  if [ $DEBUG ]; then echo "Forcing time sync."; fi
+  /etc/init.d/ntpd stop
+  ntpdate $TIMESOURCE
+  /etc/init.d/ntpd start
+
+  ################
+  # START A VNC SERVER, GREP THE DISPLAY, DO THE BUILD, KILL THE DISPLAY
+  if [ $DEBUG ]; then echo "build.sh started. (`date`)"; fi
+  logger "${HEADER} build.sh started." 
+
+  chown user:users ${TMPFILE}
+  su user -c "vncserver &> ${TMPFILE}"
+  VNC_DISPLAY=`grep -o " desktop is.*" ${TMPFILE} | awk '{print $3}'`
+
+  su user -c "export DISPLAY=${VNC_DISPLAY} && ${HOME}/build.sh ${SVN_REPOSITORY} ${TARGET}${BUILDLIST[0]} 0 > ${HOME}/${SUBDIR}/${TARGET}${BUILDLIST[0]}.txt"
+
+  su user -c "vncserver -kill ${VNC_DISPLAY} &> /dev/null"
+  rm -f ${TMPFILE}
+  chown user:users ${HOME}/.Xauthority
+
+  logger "${HEADER} build.sh finished."
+  if [ $DEBUG ]; then echo "build.sh finished. (`date`)"; fi
+
+  ################
+  # CREATE BUILD LOG PAGES
+  for (( x=${#BUILDLIST[*]}; x>=0; x-- )); do
+    if [[ $x == ${#BUILDLIST[*]} ]]; then
+      if [ $DEBUG ]; then echo "Converting log files to html pages."; fi
+      logger "${HEADER} Converting log files to html pages."
+    else
+      if [ $DEBUG ]; then echo "executing build_log.py ${BUILD_DIR}/${TARGET}${BUILDLIST[$x]}/build.log"; fi
+      su user -c "${HOME}/build_log.py ${BUILD_DIR}/${TARGET}${BUILDLIST[$x]}/build.log ${HOME}/${SUBDIR}/${ARCH}_build.log_${BUILDLIST[$x]}.html"
+    fi
+  done
+
+  ################
+  # CREATE THE SUMMARY STRING TO FEED TO THE SUMMARY BUILDER
+  for (( x=0; x<=${#BUILDLIST[*]}; x++ )); do
+    if [[ $x == ${#BUILDLIST[*]} ]]; then
+      if [ $DEBUG ]; then echo "Creating summary strings for the page builder."; fi
+    else
+      SUMMARY_STRING="$SUMMARY_STRING ${HOME}/${SUBDIR}/${TARGET}${BUILDLIST[$x]}.txt"
+      su user -c "ls ${HOME}/${SUBDIR}/${TARGET}${BUILDLIST[$x]}.txt &> /dev/null || touch ${HOME}/${SUBDIR}/${TARGET}${BUILDLIST[$x]}.txt &> /dev/null"
+      if [ $DEBUG ]; then echo "Added ${TARGET}${BUILDLIST[$x]}.txt"; fi
+    fi
+  done
+  #if [ $DEBUG ]; then echo "SUMMARY_STRING=$SUMMARY_STRING"; fi
+
+  ################
+  # ADD SVN INFO AND A LINK TO THE SUMMARY TEXT POINTING TO THE BUILD LOG
+  SVN_AUTH=`svn info ${BUILD_DIR}/${TARGET}${BUILDLIST[0]}/ | grep "Last Changed Author:"`
+  SVN_REV=`svn info ${BUILD_DIR}/${TARGET}${BUILDLIST[0]}/ | grep "Last Changed Rev:"`
+  SVN_DATE=`svn info ${BUILD_DIR}/${TARGET}${BUILDLIST[0]}/ | grep "Last Changed Date:"`
+  su user -c "echo \"\" >> ${SUMMARY}"
+  su user -c "echo \"Most recent SVN Info:\" >> ${SUMMARY}"
+  su user -c "echo \"${SVN_AUTH}\" >> ${SUMMARY}"
+  su user -c "echo \"${SVN_REV}\" >> ${SUMMARY}" 
+  su user -c "echo \"${SVN_DATE}\" >> ${SUMMARY}" 
+  su user -c "echo \"\" >> ${SUMMARY}"
+  su user -c "echo \"Link to build.log:\" >> ${SUMMARY}"
+  su user -c "echo \"http://user01/${ARCH}_build.log_0.html\" >> ${SUMMARY}"
+
+  ################
+  # BUILD THE SUMMARY PAGE
+  chown user:users ${HTML_OUT} &> /dev/null
+  if [ "${SUMMARY_STRING}" ]; then
+    su user -c "${HOME}/build_summary.py ${ARCH} ${SUMMARY_STRING} > ${HTML_OUT}"
+    if [ $? == 0 ]; then
+      logger "${HEADER} HTML Summary page updated."
+      if [ $DEBUG ]; then echo "HTML Summary page updated."; fi
+    else
+      logger "${HEADER} ERROR: Summary page failed to update. - Check summary page!"
+      if [ $DEBUG ]; then echo "ERROR: Summary page failed to update. - Check summary page!"; fi
+    fi
+  else
+    logger "${HEADER} ERROR: No summary strings created! - Check summary page!"
+    if [ $DEBUG ]; then echo "ERROR: No summary strings created! - Check summary page!"; fi
+  fi
+
+# END MAIN BRANCH
+fi
+
+################
+# CHECK FOR ERRORS AND WARNINGS
+#ERRORS=`egrep -i " error[: ]" ${BUILD_DIR}/${TARGET}${BUILDLIST[0]}/build.log`
+ERRORS=`grep -v  "^A    " ${BUILD_DIR}/${TARGET}${BUILDLIST[0]}/build.log | egrep -i " error[: ]" 2> /dev/null`
+WARNINGS=`egrep -i " warning[: ]" ${BUILD_DIR}/${TARGET}${BUILDLIST[0]}/build.log \
+  | grep -v "autoheader: WARNING:" \
+  | grep -v "cannot add non scrollable widget use gtk_scrolled_window_add_with_viewport() instead" 2> /dev/null`
+if [[ $FAILED == 1 ]]; then
+  if [ $DEBUG ]; then echo "Calling build_smtp.py because something went wrong!"; fi
+  su user -c "${HOME}/build_smtp.py \"ERROR: Automated build did not execute properly!\" ${SUMMARY}"
+  exit
+fi
+
+################
+# REPORT ERRORS
+if [[ $ERRORS && $WARNINGS ]]; then
+  if [ $DEBUG ]; then echo "build status: errors=YES warnings=YES"; fi
+  logger "${HEADER} build status: errors=YES warnings=YES"
+elif [[ $ERRORS ]]; then
+  if [ $DEBUG ]; then echo "build status: errors=YES warnings=NO"; fi
+  logger "${HEADER} build status: errors=YES warnings=NO"
+elif [[ $WARNINGS ]]; then
+  if [ $DEBUG ]; then echo "build status: errors=NO, warnings=YES"; fi
+  logger "${HEADER} build status: errors=NO warnings=YES"
+else
+  if [ $DEBUG ]; then echo "build status: errors=NO, warnings=NO"; fi
+  logger "${HEADER} build status: errors=NO, warnings=NO"
+fi
+
+if [[ $ERRORS != "" ]]; then
+  if [ $DEBUG ]; then echo "Calling build_smtp.py"; fi
+  su user -c "${HOME}/build_smtp.py \"Automated build\" ${SUMMARY}"
+  if [ $? == 0 ]; then
+    if [ $DEBUG ]; then echo "Email sent successfully."; fi
+    logger "${HEADER} Email sent successfully."
+  else
+    if [ $DEBUG ]; then echo "ERROR: build_smtp.py exited with error status!"; fi
+    logger "${HEADER} ERROR: build_smtp.py exited with error status!"
+  fi
+else
+  if [ $DEBUG ]; then echo "No errors, skipping build_smtp.py"; fi
+fi
+
+logger "${HEADER} \\---- END AUTOBUILD ----/"
+
